@@ -19,6 +19,7 @@ class MenuTree(
     /** Everything the menu can do. Kept in one place so the tree stays declarative. */
     interface MenuActions {
         fun import()
+        fun openRomgiCatalog()
         fun setupFolders()
         fun rescan()
         fun cleanupLibrary()
@@ -92,6 +93,8 @@ class MenuTree(
     private fun library() = MenuNode(
         id = "library", title = "Library",
         items = listOf(
+            MenuItem.Action("Catálogo retrô",
+                "Pesquisar e instalar jogos de uma fonte HTTPS autorizada") { actions.openRomgiCatalog() },
             MenuItem.Action("Import from Beacon",
                 "Reads an export from /sdcard/LightHouseImport/beacon") { actions.import() },
             MenuItem.Action("Set up folders",

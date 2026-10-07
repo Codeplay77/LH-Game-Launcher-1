@@ -93,11 +93,23 @@ class LauncherConfig(private val context: Context) {
         get() = get(KEY_SGDB_REPLACE_ALL) == "true"
         set(v) { set(KEY_SGDB_REPLACE_ALL, if (v) "true" else null) }
 
+    var romgiCatalogUrl: String?
+        get() = get(KEY_ROMGI_CATALOG_URL) ?: DEFAULT_ROMGI_CATALOG_URL
+        set(v) { set(KEY_ROMGI_CATALOG_URL, v?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT_ROMGI_CATALOG_URL) }
+
+    /** Play supported systems in LightHouse's own libretro player instead of the profile's external app. */
+    var builtinEmulator: Boolean
+        get() = get(KEY_BUILTIN_EMULATOR) != "false"
+        set(v) { set(KEY_BUILTIN_EMULATOR, if (v) null else "false") }
+
     companion object {
+        const val KEY_BUILTIN_EMULATOR = "builtin_emulator"
         const val KEY_SETUP = "setup_complete"
         const val KEY_COLOR_THEME = "color_theme"
         const val KEY_SGDB_KEY = "steamgriddb_key"
         const val KEY_SGDB_REPLACE_ALL = "steamgriddb_replace_all"
+        const val KEY_ROMGI_CATALOG_URL = "romgi_catalog_url"
+        const val DEFAULT_ROMGI_CATALOG_URL = "https://raw.githubusercontent.com/caprado/romgi/main/db"
         private const val TAG = "LH.Config"
     }
 }

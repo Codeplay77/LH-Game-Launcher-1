@@ -68,5 +68,9 @@ dependencies {
     implementation 'androidx.documentfile:documentfile:1.0.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3'
     implementation 'io.coil-kt:coil-compose:2.7.0'
+    implementation 'com.github.Swordfish90:libretrodroid:0.12.0'
+    implementation 'org.libtorrent4j:libtorrent4j:2.1.0-35'
+    implementation 'org.libtorrent4j:libtorrent4j-android-arm64:2.1.0-35'
+    implementation 'org.libtorrent4j:libtorrent4j-android-arm:2.1.0-35'
     debugImplementation 'androidx.compose.ui:ui-tooling'
 }

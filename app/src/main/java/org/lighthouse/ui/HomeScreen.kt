@@ -283,7 +283,7 @@ private fun SystemTabs(
 }
 
 @Composable
-private fun BumperChip(label: String, onClick: () -> Unit) {
+internal fun BumperChip(label: String, onClick: () -> Unit) {
     val theme = LocalTheme.current
     Box(
         Modifier

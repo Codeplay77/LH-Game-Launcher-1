@@ -52,6 +52,13 @@ class MainActivity : ComponentActivity() {
     /** Settings navigation stack: a path of node ids. Empty = root. */
     private var menuPath by mutableStateOf<List<String>>(emptyList())
     private var showSettings by mutableStateOf(false)
+    private var showRomgiCatalog by mutableStateOf(false)
+    private val romgi by lazy { org.lighthouse.data.RomgiCatalog(this) }
+    /** Bumped after each catalog download so the screen re-reads it. */
+    private var romgiRevision by mutableIntStateOf(0)
+    private var romgiRefreshing by mutableStateOf(false)
+    private var romgiError by mutableStateOf<String?>(null)
+    private val romgiNav = kotlinx.coroutines.flow.MutableSharedFlow<Nav>(extraBufferCapacity = 16)
     private var showDrawer by mutableStateOf(false)
     /** One cursor per screen depth, so backing out restores where you were. */
     private var menuCursors by mutableStateOf<Map<String, Int>>(emptyMap())
@@ -264,6 +271,26 @@ class MainActivity : ComponentActivity() {
                         onLaunch = ::launchApp,
                         onBack = { showDrawer = false },
                     )
+                } else if (showRomgiCatalog) {
+                    val profiles = remember(pages) { pages.map { it.profile } }
+                    val installedGames = remember(pages) {
+                        pages.filter { !it.isAppShelf }.flatMap { pg ->
+                            pg.games.filter { it.playable }.map { Triple(it.title, pg.profile.id, it.coverPath) }
+                        }
+                    }
+                    RomgiCatalogScreen(
+                        catalog = romgi,
+                        profiles = profiles,
+                        installedGames = installedGames,
+                        revision = romgiRevision,
+                        refreshing = romgiRefreshing,
+                        loadError = romgiError,
+                        navEvents = romgiNav,
+                        onSearch = { current, apply -> askText("Pesquisar jogos", "Nome do jogo", current, apply) },
+                        onRefresh = { refreshCatalog(force = true) },
+                        onLibraryChanged = { reload() },
+                        onClose = { showRomgiCatalog = false },
+                    )
                 } else if (showSettings) {
                     val st = settingsState()
                     val tree = MenuTree(st, menuActions)
@@ -338,6 +365,27 @@ class MainActivity : ComponentActivity() {
         // something the user did and must not be buried under a wizard.
         if (!app.config.setupComplete && verifyFor == null) onboardStep = Step.WELCOME
         reload()
+        refreshCatalog(force = false)
+        org.lighthouse.data.DownloadQueue.onInstalled = { e ->
+            toast("Instalado: ${e.title}")
+            reload()
+        }
+    }
+
+    /** Downloads the catalog in the background; at startup only when missing or older than a day. */
+    private fun refreshCatalog(force: Boolean) {
+        if (romgiRefreshing) return
+        if (!force && !romgi.isStale(24L * 60 * 60 * 1000)) return
+        romgiRefreshing = true
+        lifecycleScope.launch {
+            val url = app.config.romgiCatalogUrl ?: org.lighthouse.data.LauncherConfig.DEFAULT_ROMGI_CATALOG_URL
+            romgiError = runCatching { romgi.update(url) }.exceptionOrNull()?.let {
+                val cached = if (romgi.isInstalled()) " (usando cópia local)" else ""
+                "Falha ao atualizar o catálogo: ${it.message ?: it::class.simpleName}$cached"
+            }
+            romgiRevision++
+            romgiRefreshing = false
+        }
     }
 
     private fun restorePending() {
@@ -458,6 +506,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handle(nav: Nav) {
+        // The catalog drives its own grid; the text prompt (its search box) still wins while open.
+        if (showRomgiCatalog && prompt == null && busy == null) { romgiNav.tryEmit(nav); return }
         val page = pages.getOrNull(systemIndex)
         when (nav) {
             // L1/R1 double as the text cursor while a prompt is open - there is
@@ -567,9 +617,11 @@ class MainActivity : ComponentActivity() {
                 activate(n, onboardCursor.coerceIn(0, (n.items.size - 1).coerceAtLeast(0)))
             } else if (showAppPicker) {
                 appPickerRows().getOrNull(appPickerCursor)?.let { toggleApp(it.pkg, !it.chosen) }
-            } else if (showDrawer) {
-                drawerApps.getOrNull(drawerCursor)?.let { launchApp(it.first) }
-            } else if (showSettings) {
+                } else if (showDrawer) {
+                    drawerApps.getOrNull(drawerCursor)?.let { launchApp(it.first) }
+                } else if (showRomgiCatalog) {
+                    Unit
+                } else if (showSettings) {
                 if (pane == Pane.RAIL) {
                     pane = Pane.CONTENT
                 } else {
@@ -596,6 +648,7 @@ class MainActivity : ComponentActivity() {
                 editingId != null -> { editingId = null; editingSpec = null }
                 showAppPicker -> { showAppPicker = false; appPickerFor = null; reload() }
                 showDrawer -> showDrawer = false
+                showRomgiCatalog -> { showRomgiCatalog = false; reload() }
                 showSettings -> menuBack()
                 onboardStep != null -> onboardBack()
                 // On the home screen B opens the app drawer.
@@ -1143,12 +1196,33 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
+        val core = org.lighthouse.emu.EmulatorCores.coreFor(page.profile.id)
+        if (core != null && entry.uri != null && app.config.builtinEmulator) {
+            launchBuiltin(core, entry.uri, game.title)
+            return
+        }
         val target = LaunchIntentBuilder.Target(entry.uri, entry.id, game.title)
         when (val r = LaunchIntentBuilder.build(page.profile.launch, target)) {
             is LaunchIntentBuilder.Result.Unbuildable -> toast("Cannot launch: ${r.reason}")
             is LaunchIntentBuilder.Result.Ready ->
                 runCatching { startActivity(r.intent) }
                     .onFailure { toast("Launch failed: ${it.message ?: it::class.simpleName}") }
+        }
+    }
+
+    private val cores by lazy { org.lighthouse.emu.EmulatorCores(this) }
+
+    private fun launchBuiltin(core: String, rom: android.net.Uri, title: String) {
+        lifecycleScope.launch {
+            if (!cores.isDownloaded(core)) busy = "Baixando emulador $core..."
+            runCatching {
+                val file = cores.ensure(core) { pct -> busy = "Baixando emulador $core · $pct%" }
+                busy = null
+                startActivity(org.lighthouse.emu.GameActivity.intent(this@MainActivity, core, file.path, rom, title))
+            }.onFailure {
+                busy = null
+                toast("Emulador indisponível: ${it.message ?: it::class.simpleName}")
+            }
         }
     }
 
@@ -1230,6 +1304,7 @@ class MainActivity : ComponentActivity() {
 
     private val menuActions = object : MenuTree.MenuActions {
         override fun import() = runImport()
+        override fun openRomgiCatalog() { showSettings = false; showRomgiCatalog = true }
         override fun setupFolders() { showSettings = false; startSetup() }
         override fun rescan() { reload(); toast("Rescanning…") }
         override fun cleanupLibrary() = this@MainActivity.cleanupLibrary()

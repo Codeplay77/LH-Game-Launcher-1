@@ -50,5 +50,12 @@
                 <data android:pathPattern=".*\\.lhtheme" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".emu.GameActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"
+            android:theme="@style/Theme.LightHouse" />
     </application>
 </manifest>
