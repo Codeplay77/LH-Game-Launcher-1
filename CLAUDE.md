@@ -17,11 +17,11 @@ Launcher Android estilo console (foco em portáteis com controle, ex.: Odin 2), 
 ## Funcionalidades principais
 
 - **Biblioteca / tela inicial** (`HomeScreen.kt`): grade de capas por console, L1/R1 troca de console.
-- **Catálogo retrô** (`RomgiCatalogScreen.kt`, `data/RomgiCatalog.kt`): banco do Romgi (`version.json` + `romdb.db.gz`, schema v4), baixado em segundo plano ao abrir o app (a cada 24h). Abas: Instalados + um por console; X pesquisa; A instala/exclui.
+- **Catálogo retrô** (`RomgiCatalogScreen.kt`, `data/RomgiCatalog.kt`): banco no formato do Romgi (`version.json` + `romdb.db.gz`, schema v4), servido do repositório próprio `lh-romdb` (cópia filtrada para os consoles do LH, script `scripts/filter_romgi.py`), baixado em segundo plano ao abrir o app (a cada 24h). Abas: Instalados + um por console; X pesquisa; A instala/exclui.
   - Ids do Romgi diferem dos perfis (ex.: `nds`→`ds`, `ps1`→`psx`, `smd`→`genesis`, `dc`→`dreamcast`) — mapa em `RomgiCatalog.PROFILE_ALIASES`.
   - Instalações passam pela fila `data/DownloadQueue.kt` (uma por vez, independe da tela; capa mostra fila/%/falha).
   - Download: links diretos HTTPS primeiro, depois torrent (`data/TorrentFetcher.kt`, libtorrent4j, baixa só o arquivo do jogo). `.zip` é extraído na pasta do console, exceto arcade.
-- **Emulador embutido** (`emu/`): LibretroDroid roda cores libretro dentro do app (`GameActivity`), sem abrir apps de terceiros. Cores baixados do buildbot do libretro (`EmulatorCores`). Select+Start / Home abre o menu de pausa. Desligável com `builtin_emulator = false`.
+- **Emulador embutido** (`emu/`): LibretroDroid roda cores libretro dentro do app (`GameActivity`), sem abrir apps de terceiros. Cores baixados do buildbot do libretro (`EmulatorCores`), automaticamente para todo console com jogos (`prefetch`). Mapa: NES Mesen, SNES Snes9x, GB/GBC SameBoy, GBA mGBA, N64 Mupen64Plus-Next, DS melonDS, GC/Wii Dolphin, SMS/MD/SCD Genesis Plus GX, 32X PicoDrive, Saturn Beetle Saturn (sem BIOS: YabaSanshiro), DC Flycast, PS1 SwanStation (sem BIOS: PCSX ReARMed), PSP PPSSPP. 3DS, PS2 (NetherSX2/AetherSX2), Wii U, Switch, PS3, Vita, Xbox e 360 usam app externo. BIOS vão em `Android/data/<pacote>/files/emulation/system/`. Select+Start / Home abre o menu de pausa. Desligável com `builtin_emulator = false`.
   - Cuidado: `serializeSRAM`/`serializeState`/`unserializeState` esperam a thread GL; chamá-los com a view pausada trava o app inteiro. Salvar antes de pausar (ver `glPaused` em `GameActivity`).
 
 ## Padrão visual (reutilizar, não recriar)

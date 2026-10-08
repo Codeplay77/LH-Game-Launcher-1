@@ -335,6 +335,13 @@ object CoverScraper {
         return out
     }
 
+    /** A cover whose URL is already known (the catalog's boxart_url), saved where scraped art goes. */
+    fun fetchKnown(url: String, platformId: String, title: String, mediaDir: File): File? {
+        val ext = url.substringAfterLast('.', "png").substringBefore('?').take(4).ifBlank { "png" }
+        val dest = File(mediaDir, "$platformId/scraped/${safe(title)}.$ext")
+        return if (dest.isFile && dest.length() > 0 || download(url, dest)) dest else null
+    }
+
     /** Downloads a chosen candidate's full-size image as this game's cover. */
     fun applyCandidate(
         candidate: ArtCandidate,

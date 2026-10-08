@@ -186,11 +186,12 @@ fun RomgiCatalogScreen(
     }
 
     val downloads by DownloadQueue.states.collectAsState()
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     fun install(entry: RomgiCatalog.Entry) {
         val root = rootFor(entry) ?: return
         DownloadQueue.dismiss(entry.slug)
-        status = if (DownloadQueue.enqueue(catalog, entry, root)) "Na fila: ${entry.title}"
+        status = if (DownloadQueue.enqueue(context, catalog, entry, root)) "Na fila: ${entry.title}"
         else "${entry.title} já está na fila"
     }
 

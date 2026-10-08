@@ -203,6 +203,13 @@ class MainActivity : ComponentActivity() {
             // Re-read on every recomposition trigger so a theme change applies
             // immediately rather than after a restart.
             val theme = remember(colorEpoch) { app.activeColors() }
+            // The screen must not sleep mid-download while LH is in front; the service covers screen-off.
+            val downloads by org.lighthouse.data.DownloadQueue.states.collectAsState()
+            val downloading = downloads.values.any { it !is org.lighthouse.data.DownloadQueue.State.Failed }
+            LaunchedEffect(downloading) {
+                val flag = android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                if (downloading) window.addFlags(flag) else window.clearFlags(flag)
+            }
             CompositionLocalProvider(LocalTheme provides theme) {
               Box(Modifier.fillMaxSize()) {
                 val ed = editingId
@@ -368,8 +375,51 @@ class MainActivity : ComponentActivity() {
         refreshCatalog(force = false)
         org.lighthouse.data.DownloadQueue.onInstalled = { e ->
             toast("Instalado: ${e.title}")
-            reload()
+            lifecycleScope.launch {
+                fetchCatalogCover(e)
+                reload()
+            }
         }
+    }
+
+    /**
+     * Covers that came with a catalog install, waiting for the rescan that turns the downloaded
+     * file into a library game. Keyed by profile id + normalised title.
+     */
+    private val pendingCovers = java.util.concurrent.ConcurrentHashMap<Pair<String, String>, String>()
+
+    private suspend fun fetchCatalogCover(e: org.lighthouse.data.RomgiCatalog.Entry) {
+        val url = e.boxartUrl?.takeIf { it.startsWith("https://") || it.startsWith("http://") } ?: return
+        val profileId = pages.firstOrNull { org.lighthouse.data.RomgiCatalog.matchesProfile(e.platform, it.profile.id) }
+            ?.profile?.id ?: return
+        val file = withContext(Dispatchers.IO) {
+            org.lighthouse.scrape.CoverScraper.fetchKnown(url, profileId, e.title, app.library.mediaDir)
+        } ?: return
+        pendingCovers[profileId to org.lighthouse.scrape.CoverScraper.norm(e.title)] = file.absolutePath
+    }
+
+    /**
+     * Attaches pending catalog covers to the games they belong to. Matched on the same lossy title
+     * key the scraper uses, so "Pokemon - Emerald Version (USA, Europe).gba" finds "Pokemon - Emerald Version".
+     * @return true when any record changed and the shelf needs rebuilding.
+     */
+    private fun applyPendingCovers(built: List<SystemPage>): Boolean {
+        if (pendingCovers.isEmpty()) return false
+        val updates = mutableListOf<org.lighthouse.data.GameRecord>()
+        for (pg in built) for (g in pg.games) {
+            if (g.coverPath != null) continue
+            val k = pg.profile.id to org.lighthouse.scrape.CoverScraper.norm(g.title)
+            val cover = pendingCovers.remove(k) ?: continue
+            val key = g.record?.key ?: g.entry?.key ?: continue
+            updates += (g.record ?: org.lighthouse.data.GameRecord(
+                key = key,
+                platformId = pg.profile.id,
+                title = g.title,
+                uri = key.takeIf { it.startsWith("content://") },
+            )).copy(coverPath = cover)
+        }
+        if (updates.isNotEmpty()) app.library.put(updates)
+        return updates.isNotEmpty()
     }
 
     /** Downloads the catalog in the background; at startup only when missing or older than a day. */
@@ -418,7 +468,9 @@ class MainActivity : ComponentActivity() {
     /** @param landOn platform id to select once the rebuild finishes. */
     private fun reload(landOn: String? = null) {
         lifecycleScope.launch {
-            val built = withContext(Dispatchers.IO) { buildPages() }
+            var built = withContext(Dispatchers.IO) { buildPages() }
+            // Before the art pass queues these games for a by-name search they no longer need.
+            if (applyPendingCovers(built)) built = withContext(Dispatchers.IO) { buildPages() }
             pages = built
             val wanted = landOn?.let { id -> built.indexOfFirst { it.profile.id == id } }
                 ?.takeIf { it >= 0 }
@@ -429,6 +481,7 @@ class MainActivity : ComponentActivity() {
             // place that needs to know - and asking for art should never be a
             // thing the user remembers to do.
             queueArtForAll()
+            prefetchCores(built)
         }
     }
 
@@ -1196,9 +1249,8 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
-        val core = org.lighthouse.emu.EmulatorCores.coreFor(page.profile.id)
-        if (core != null && entry.uri != null && app.config.builtinEmulator) {
-            launchBuiltin(core, entry.uri, game.title)
+        if (org.lighthouse.emu.EmulatorCores.hasCore(page.profile.id) && entry.uri != null && app.config.builtinEmulator) {
+            launchBuiltin(page.profile.id, entry.uri, game.title)
             return
         }
         val target = LaunchIntentBuilder.Target(entry.uri, entry.id, game.title)
@@ -1212,13 +1264,45 @@ class MainActivity : ComponentActivity() {
 
     private val cores by lazy { org.lighthouse.emu.EmulatorCores(this) }
 
-    private fun launchBuiltin(core: String, rom: android.net.Uri, title: String) {
+    private var prefetching = false
+
+    /** Every console with games gets its emulator ahead of time, so the first launch is instant. */
+    private fun prefetchCores(built: List<SystemPage>) {
+        if (prefetching || !app.config.builtinEmulator) return
+        val ids = built.filter { !it.isAppShelf && it.games.isNotEmpty() }.map { it.profile.id }
+            .filter { org.lighthouse.emu.EmulatorCores.hasCore(it) }
+        if (ids.isEmpty()) return
+        prefetching = true
         lifecycleScope.launch {
-            if (!cores.isDownloaded(core)) busy = "Baixando emulador $core..."
+            try { cores.prefetch(ids) } finally { prefetching = false }
+        }
+    }
+
+    private fun launchBuiltin(platformId: String, rom: android.net.Uri, title: String) {
+        // Asked once: with "all files access" cores read games in place (see GameActivity.realPath).
+        val prefs = getSharedPreferences("emulator", MODE_PRIVATE)
+        if (android.os.Build.VERSION.SDK_INT >= 30 && !android.os.Environment.isExternalStorageManager() &&
+            !prefs.getBoolean("asked_all_files", false)
+        ) {
+            prefs.edit().putBoolean("asked_all_files", true).apply()
             runCatching {
-                val file = cores.ensure(core) { pct -> busy = "Baixando emulador $core · $pct%" }
+                startActivity(android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+                toast("Permita o acesso a todos os arquivos e abra o jogo de novo")
+                return
+            }
+        }
+        lifecycleScope.launch {
+            // BIOS first: having one decides which core runs the console.
+            if (cores.biosToFetch(platformId)) {
+                busy = "Baixando BIOS..."
+                cores.fetchBios(platformId)
+            }
+            val core = cores.coreFor(platformId)!!
+            if (!cores.isReady(core)) busy = "Baixando emulador ${core.name}..."
+            runCatching {
+                val file = cores.ensure(core) { pct -> busy = "Baixando emulador ${core.name} · $pct%" }
                 busy = null
-                startActivity(org.lighthouse.emu.GameActivity.intent(this@MainActivity, core, file.path, rom, title))
+                startActivity(org.lighthouse.emu.GameActivity.intent(this@MainActivity, core.name, file.path, rom, title))
             }.onFailure {
                 busy = null
                 toast("Emulador indisponível: ${it.message ?: it::class.simpleName}")
@@ -1304,7 +1388,13 @@ class MainActivity : ComponentActivity() {
 
     private val menuActions = object : MenuTree.MenuActions {
         override fun import() = runImport()
-        override fun openRomgiCatalog() { showSettings = false; showRomgiCatalog = true }
+        override fun openRomgiCatalog() {
+            showSettings = false; showRomgiCatalog = true
+            // Asked once, here: the download notification is the only sign of progress with the screen off.
+            if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 42)
+        }
         override fun setupFolders() { showSettings = false; startSetup() }
         override fun rescan() { reload(); toast("Rescanning…") }
         override fun cleanupLibrary() = this@MainActivity.cleanupLibrary()

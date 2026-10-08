@@ -8,6 +8,10 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
+import android.system.Os
+import android.os.Build
+import android.os.Environment
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -37,13 +41,14 @@ import androidx.lifecycle.lifecycleScope
 import com.swordfish.libretrodroid.GLRetroView
 import com.swordfish.libretrodroid.GLRetroViewData
 import com.swordfish.libretrodroid.ShaderConfig
-import com.swordfish.libretrodroid.VirtualFile
+import com.swordfish.libretrodroid.Variable
 import org.lighthouse.theme.LocalTheme
 import org.lighthouse.ui.GameContextMenu
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.zip.ZipFile
 
 /**
  * Runs a game in-process through a libretro core, so it feels native: no third-party app,
@@ -104,27 +109,98 @@ class GameActivity : ComponentActivity() {
             shader = ShaderConfig.Default
             rumbleEventsEnabled = true
             preferLowLatencyAudio = true
+            variables = CORE_OPTIONS[core].orEmpty().map { (k, v) -> Variable(k, v) }.toTypedArray()
         }
+        val real = realPath(rom)
         when {
             rom.scheme == "file" -> data.gameFilePath = rom.path
-            // Small ROMs are copied once: every core can read a real file. Big discs stream via VFS instead.
+            real != null -> data.gameFilePath = real.path
+            // Small ROMs are copied once: every core can read a real file. Big discs are not copied:
+            // a symlink with the right name points at the already open descriptor, so cores without
+            // VFS support (PCSX2...) still get a plain path.
             size in 1..COPY_LIMIT -> data.gameFilePath = cachedCopy(rom, name, size).path
             else -> {
                 val fd = contentResolver.openFileDescriptor(rom, "r") ?: error("sem acesso ao arquivo")
                 romFd = fd
-                data.gameVirtualFiles = listOf(VirtualFile(name, fd))
+                val link = File(File(cacheDir, "fdlinks").apply { deleteRecursively(); mkdirs() }, name)
+                Os.symlink("/proc/self/fd/${fd.fd}", link.path)
+                data.gameFilePath = link.path
             }
         }
+        data.gameFilePath?.let { fetchSbi(File(it)) }
         return GLRetroView(this, data).apply { isFocusable = false }
     }
 
     private fun cachedCopy(rom: Uri, name: String, size: Long): File {
         val dir = File(cacheDir, "roms/${rom.toString().hashCode().toUInt()}").apply { mkdirs() }
         val f = File(dir, name)
-        if (f.length() == size) return f
-        contentResolver.openInputStream(rom)!!.use { input -> f.outputStream().use { input.copyTo(it) } }
+        if (f.length() != size) copyTo(rom, f)
+        // Disc sheets (.cue/.gdi/.m3u) only point at the real tracks: bring those along from the same folder.
+        if (name.substringAfterLast('.').lowercase() in SHEETS) {
+            for (ref in sheetRefs(f)) {
+                val target = File(dir, ref)
+                if (target.isFile || !target.canonicalPath.startsWith(dir.canonicalPath + File.separator)) continue
+                val sibling = siblingUri(rom, ref) ?: continue
+                target.parentFile?.mkdirs()
+                runCatching { copyTo(sibling, target) }.onFailure { target.delete() }
+            }
+        }
         return f
     }
+
+    /** Plain path of a SAF document, when "all files access" is granted (Android 11+). */
+    private fun realPath(rom: Uri): File? {
+        if (Build.VERSION.SDK_INT < 30 || !Environment.isExternalStorageManager()) return null
+        if (rom.authority != "com.android.externalstorage.documents") return null
+        val id = runCatching { DocumentsContract.getDocumentId(rom) }.getOrNull() ?: return null
+        val volume = id.substringBefore(':')
+        val root = if (volume == "primary") Environment.getExternalStorageDirectory().path else "/storage/$volume"
+        return File(root, id.substringAfter(':', "")).takeIf { it.canRead() }
+    }
+
+    /**
+     * LibCrypt-protected PS1 discs (mostly PAL) need a .sbi named like the image beside it; take it
+     * from the redump pack EmulatorCores downloads with the PS1 BIOS.
+     */
+    private fun fetchSbi(game: File) {
+        if (core !in PS1_CORES) return
+        val sbi = File(game.parentFile, game.nameWithoutExtension + ".sbi")
+        if (sbi.isFile) return
+        val pack = File(dir("system"), "sbi.zip").takeIf { it.isFile } ?: return
+        runCatching {
+            ZipFile(pack).use { zip ->
+                val entry = zip.getEntry("ByName/${sbi.name}") ?: return
+                zip.getInputStream(entry).use { input -> sbi.outputStream().use { input.copyTo(it) } }
+            }
+        }
+    }
+
+    private fun copyTo(uri: Uri, f: File) {
+        val tmp = File(f.path + ".part")
+        contentResolver.openInputStream(uri)!!.use { input -> tmp.outputStream().use { input.copyTo(it) } }
+        check(tmp.renameTo(f)) { "falha ao copiar ${f.name}" }
+    }
+
+    /** Files a cue/gdi/m3u sheet refers to, relative to its folder. */
+    private fun sheetRefs(sheet: File): List<String> = sheet.readLines().mapNotNull { line ->
+        val l = line.trim()
+        when (sheet.extension.lowercase()) {
+            "cue" -> Regex("""^FILE\s+"?(.+?)"?\s+\S+$""", RegexOption.IGNORE_CASE).find(l)?.groupValues?.get(1)
+            "gdi" -> l.split(Regex("\\s+")).takeIf { it.size >= 5 }?.let { p ->
+                Regex(""""(.+)"""").find(l)?.groupValues?.get(1) ?: p[4]
+            }
+            else -> l.takeIf { it.isNotEmpty() && !it.startsWith("#") }
+        }
+    }.map { it.replace('\\', '/') }.distinct()
+
+    /** Document in the same SAF folder as [rom] (rom must come from a tree URI). */
+    private fun siblingUri(rom: Uri, relative: String): Uri? = runCatching {
+        val docId = DocumentsContract.getDocumentId(rom)
+        val parent = docId.substringBeforeLast('/', "")
+        if (parent.isEmpty()) return null
+        val uri = DocumentsContract.buildDocumentUriUsingTree(rom, "$parent/$relative")
+        uri.takeIf { DocumentFile.fromSingleUri(this, it)?.exists() == true }
+    }.getOrNull()
 
     private fun dir(kind: String) = File(getExternalFilesDir(null), "emulation/$kind").apply { mkdirs() }
     private fun sramFile() = File(dir("saves/$core"), "$saveKey.srm")
@@ -245,11 +321,15 @@ class GameActivity : ComponentActivity() {
     private fun fail(text: String) { toast(text); finish() }
     private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
 
-    private fun errorText(code: Int) = when (code) {
-        GLRetroView.ERROR_LOAD_LIBRARY -> "Falha ao carregar o emulador $core"
-        GLRetroView.ERROR_LOAD_GAME -> "O emulador $core não abriu este arquivo (formato ou BIOS ausente)"
-        GLRetroView.ERROR_GL_NOT_COMPATIBLE -> "GPU incompatível com o emulador $core"
-        else -> "Erro no emulador ($code)"
+    private fun errorText(code: Int): String {
+        val bios = EmulatorCores(this).missingBios(core)
+        val biosText = if (bios.isEmpty()) "" else "\nBIOS faltando (basta um): ${bios.joinToString(", ")}. Copie para ${File(getExternalFilesDir(null), "emulation/system").absolutePath}"
+        return when (code) {
+            GLRetroView.ERROR_LOAD_LIBRARY -> "Falha ao carregar o emulador $core"
+            GLRetroView.ERROR_LOAD_GAME -> "O emulador $core não abriu este arquivo (formato ou BIOS ausente)$biosText"
+            GLRetroView.ERROR_GL_NOT_COMPATIBLE -> "GPU incompatível com o emulador $core"
+            else -> "Erro no emulador ($code)"
+        }
     }
 
     @Composable
@@ -280,6 +360,16 @@ class GameActivity : ComponentActivity() {
         private const val EXTRA_ROM = "rom"
         private const val EXTRA_TITLE = "title"
         private const val COPY_LIMIT = 256L * 1024 * 1024
+        private val SHEETS = setOf("cue", "gdi", "m3u")
+        private val PS1_CORES = setOf("swanstation", "pcsx_rearmed")
+
+        /**
+         * Core options forced by the player. LibretroDroid only hands cores a GLES context, while
+         * these hardware renderers want desktop GL (shaders fail on GLES), so they draw in software.
+         */
+        private val CORE_OPTIONS = mapOf(
+            "swanstation" to mapOf("swanstation_GPU_Renderer" to "Software"),
+        )
 
         fun intent(context: Context, core: String, corePath: String, rom: Uri, title: String) =
             Intent(context, GameActivity::class.java)

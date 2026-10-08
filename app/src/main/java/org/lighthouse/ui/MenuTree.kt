@@ -266,6 +266,7 @@ class MenuTree(
                     detail = when {
                         c.alreadyAdded -> "Already added"
                         c.installedEmulator != null -> "${c.installedEmulator} is installed"
+                        org.lighthouse.emu.EmulatorCores.hasCore(c.system.id) -> "Built-in emulator"
                         c.system.emulators.isEmpty() -> "No Android emulator exists yet"
                         else -> "No supported emulator installed"
                     },

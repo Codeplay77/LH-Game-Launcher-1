@@ -43,11 +43,12 @@ object DownloadQueue {
     }
 
     /** @return false when the game is already queued or downloading. */
-    fun enqueue(catalog: RomgiCatalog, entry: RomgiCatalog.Entry, treeUri: String): Boolean {
+    fun enqueue(context: android.content.Context, catalog: RomgiCatalog, entry: RomgiCatalog.Entry, treeUri: String): Boolean {
         val current = _states.value[entry.slug]
         if (current is State.Queued || current is State.Running) return false
         _states.update { it + (entry.slug to State.Queued) }
         jobs.trySend(Job(catalog, entry, treeUri))
+        DownloadService.start(context.applicationContext)
         return true
     }
 
